@@ -5,7 +5,7 @@ Chaque batch contient plusieurs sous-graphes indépendants.
 
 import torch
 import torch.nn.functional as F
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.loader import DataLoader
 import numpy as np
@@ -36,13 +36,14 @@ class SubgraphTrainer:
         test_subgraphs = [subgraphs_list[i] for i in test_indices]
         
         # Créer les DataLoaders
-        self.train_loader = DataLoader(train_subgraphs, batch_size=batch_size, shuffle=True)
-        self.val_loader = DataLoader(val_subgraphs, batch_size=batch_size, shuffle=False)
-        self.test_loader = DataLoader(test_subgraphs, batch_size=batch_size, shuffle=False)
+        self.train_loader = DataLoader(train_subgraphs, batch_size=batch_size, persistent_workers=True, num_workers=4, pin_memory=True, shuffle=True, prefetch_factor=10)
+        self.val_loader = DataLoader(val_subgraphs, batch_size=batch_size, persistent_workers=True,num_workers=4, pin_memory=True, shuffle=False, prefetch_factor=10)
+        self.test_loader = DataLoader(test_subgraphs, batch_size=batch_size, num_workers=4, pin_memory=True, shuffle=False, prefetch_factor=10)
         
-        self.optimizer = Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        self.optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min',
-                                          factor=0.5, patience=10, verbose=True)
+                                          factor=0.5, patience=10)
         
         self.history = {
             'train_loss': [],

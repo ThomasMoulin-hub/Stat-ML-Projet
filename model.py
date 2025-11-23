@@ -107,15 +107,15 @@ class SpatialGATLarge(nn.Module):
                             dropout=dropout, concat=True)
         self.conv2 = GATConv(hidden_channels * heads, 96, heads=2,
                             dropout=dropout, concat=True)
-        self.conv3 = GATConv(96 * 2, 64, heads=1,
+        self.conv3 = GATConv(96 * 2, 128, heads=1,
                             dropout=dropout, concat=False)
 
         # MLP final
         self.mlp = nn.Sequential(
-            nn.Linear(64, 32),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(32, out_channels)
+            nn.Linear(64, out_channels)
         )
 
     def forward(self, x, edge_index):
