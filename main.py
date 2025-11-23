@@ -193,7 +193,9 @@ if use_joint_encoder:
         joint_hidden=256,       # Représentation fusionnée
         gat_hidden=256,         # GAT layers
         heads=4,
-        dropout=0.4
+        dropout=0.4,
+        use_cross_attention=True,   # NOUVEAU: Attention croisée ARN ↔ Protéines
+        use_global_pooling=False    # False: prédiction par nœud (cellule centrale)
     )
 else:
     print(f"\n📊 Utilisation du modèle standard (toutes features concaténées)")

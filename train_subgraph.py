@@ -69,8 +69,9 @@ class SubgraphTrainer:
             self.optimizer.zero_grad()
             
             # Forward pass - prédire UNIQUEMENT la cellule centrale (nœud 0) de chaque sous-graphe
-            pred = self.model(batch.x, batch.edge_index)
-            
+            # Passer batch.batch pour le global pooling
+            pred = self.model(batch.x, batch.edge_index, batch.batch)
+
             # Extraire uniquement les prédictions des cellules centrales
             # Dans chaque sous-graphe, la cellule centrale est le nœud 0
             batch_size = batch.num_graphs
@@ -112,9 +113,9 @@ class SubgraphTrainer:
         for batch in loader:
             batch = batch.to(self.device)
             
-            # Forward pass
-            pred = self.model(batch.x, batch.edge_index)
-            
+            # Forward pass avec batch pour le global pooling
+            pred = self.model(batch.x, batch.edge_index, batch.batch)
+
             # Extraire les prédictions des cellules centrales
             batch_size = batch.num_graphs
             central_predictions = []
@@ -229,8 +230,9 @@ class SubgraphTrainer:
         
         for batch in loader:
             batch = batch.to(self.device)
-            pred = self.model(batch.x, batch.edge_index)
-            
+            # Passer batch.batch pour le global pooling
+            pred = self.model(batch.x, batch.edge_index, batch.batch)
+
             # Extraire cellules centrales
             batch_size = batch.num_graphs
             central_predictions = []
