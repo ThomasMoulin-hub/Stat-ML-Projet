@@ -39,7 +39,7 @@ import json
 
 print(f"{'='*60}")
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
 
 print(f"Device utilisé: {device}")
 print("🎯 Approche: SOUS-GRAPHES LOCAUX")
@@ -192,7 +192,7 @@ trainer = SubgraphTrainer(
         train_indices=train_indices,
         val_indices=val_indices,
         test_indices=test_indices,
-        batch_size=400,
+        batch_size=600,
         lr=0.001,
         weight_decay=5e-4,
         device=device,
