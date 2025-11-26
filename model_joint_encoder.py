@@ -405,7 +405,7 @@ class SpatialGATLargeWithJointEncoder(nn.Module):
             nn.Linear(64, out_channels)
         )
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, data):
         """
         Forward pass avec connexions résiduelles et pooling global.
 
@@ -417,6 +417,9 @@ class SpatialGATLargeWithJointEncoder(nn.Module):
         Returns:
             out: Coordonnées prédites (n_nodes ou batch_size, 2)
         """
+
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
         # Joint encoding avec attention croisée
         x = self.joint_encoder(x)
 

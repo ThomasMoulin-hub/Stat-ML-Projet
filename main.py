@@ -1,38 +1,19 @@
 #!/user/tmm2219/.conda/envs/statml/bin/python
-#import squidpy as sq
-import spatialdata as sd
+
 import spatialdata_io as sio
-from spatialdata import read_zarr
-import pandas as pd
-#import spatialdata_plot
 import torch
 from scipy.sparse import issparse
-
 from model_joint_encoder import create_joint_encoder_model
 from data_preprocessing import preprocess_adata
 from data_preprocessing_subgraph import build_local_subgraphs, create_subgraph_splits
-from train_subgraph import SubgraphTrainer as Trainer
-
-
+from train_subgraph import SubgraphTrainer
 from model import create_model
 from evaluate import (evaluate_predictions, plot_training_history,
                       plot_predictions_vs_true, plot_spatial_predictions,
                       plot_error_distribution, analyze_extreme_errors)
 import os
-
 import pickle
 import json
-
-
-dataset_name="Xenium_V1_Human_Kidney_FFPE_Protein_updated_outs/"
-xenium_path = "./data/" + dataset_name
-
-sdata = sio.xenium(xenium_path, gex_only=False, morphology_focus=False, cells_boundaries=False, nucleus_boundaries=False, cells_labels=False, nucleus_labels=False, cells_as_circles=True)
-
-# Récupère l'AnnData
-adata = sdata.tables["table"]
-
-
 
 # # Pipeline GNN pour prédiction de coordonnées spatiales
 #
@@ -56,51 +37,37 @@ adata = sdata.tables["table"]
 # - **Plus conforme à votre description** : chaque point d'entraînement = 1 sous-graphe
 # - Isolement complet : chaque prédiction utilise uniquement son voisinage local
 
-
-
-
 print(f"{'='*60}")
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 print(f"Device utilisé: {device}")
 print("🎯 Approche: SOUS-GRAPHES LOCAUX")
-print("   • Chaque point = 1 cellule centrale + 29 voisins")
-print("   • Prédiction uniquement de la cellule centrale")
+print("   • Chaque point = 1 cellule centrale + 49 voisins")
+print("   • Entraînement: supervision de TOUTES les cellules")
+print("   • Évaluation: prédiction des cellules centrales uniquement")
 print("   • Traitement par batches")
 print(f"{'='*60}\n")
 
 
 # Imports pour le pipeline GNN
-
-
-
 # ## 1. Préparation et normalisation des données
-
-
-# Prétraiter les données (filtrer et normaliser)
-adata_processed = preprocess_adata(adata, normalize_genes=True, normalize_proteins=True)
-
-
-# Extraire les features et coordonnées spatiales
-if issparse(adata_processed.X):
-    features = adata_processed.X.toarray()
-else:
-    features = adata_processed.X
-
-spatial_coords = adata_processed.obsm["spatial"]
-
-print(f"Shape des features: {features.shape}")
-print(f"Shape des coordonnées: {spatial_coords.shape}")
-
-
 # ## 2. Construction du graphe K-NN basé sur similarité d'expression
+dataset_name="Xenium_V1_Human_Kidney_FFPE_Protein_updated_outs/"
 
+xenium_path = "./data/" + dataset_name
 
+sdata = sio.xenium(xenium_path, gex_only=False, morphology_focus=False, cells_boundaries=False,
+                   nucleus_boundaries=False, cells_labels=False, nucleus_labels=False, cells_as_circles=True)
+# Récupère l'AnnData
+adata = sdata.tables["table"]
+adata_processed = preprocess_adata(adata, normalize_genes=True, normalize_proteins=True)
 
 # Approche sous-graphes locaux
 print("Construction des sous-graphes locaux...")
 # Paramètres de construction
 k_value = 49
-metric_value = 'cosine'
+metric_value = 'euclidean'
 cache_dir = 'cache_' + dataset_name
 os.makedirs(cache_dir, exist_ok=True)
 cache_key = f"subgraphs_k{k_value}_metric_{metric_value}"
@@ -115,6 +82,17 @@ if use_cache:
     with open(scaler_path, 'rb') as f:
         coords_scaler = pickle.load(f)
 else:
+    # Extraire les features et coordonnées spatiales
+    if issparse(adata_processed.X):
+        features = adata_processed.X.toarray()
+    else:
+        features = adata_processed.X
+
+    spatial_coords = adata_processed.obsm["spatial"]
+
+    print(f"Shape des features: {features.shape}")
+    print(f"Shape des coordonnées: {spatial_coords.shape}")
+
     print("🚀 Pas de cache ou incomplet: construction des sous-graphes")
     subgraphs_list, coords_scaler = build_local_subgraphs(
         features=features,
@@ -159,14 +137,11 @@ print(f"\nExemple de sous-graphe:")
 print(f"  • Nœuds: {data.x.shape[0]} (1 centrale + {data.x.shape[0]-1} voisins)")
 print(f"  • Features par nœud: {data.x.shape[1]}")
 print(f"  • Arêtes: {data.edge_index.shape[1]}")
-print(f"  • Cible: position de la cellule centrale uniquement")
-
-
+print(f"  • Cibles (entraînement): positions de TOUTES les cellules ({data.y.shape[0]})")
+print(f"  • Évaluation finale: cellule centrale uniquement")
 
 
 # ## 3. Création du modèle GAT
-
-
 # Créer le modèle avec Joint Encoder
 in_channels = subgraphs_list[0].x.shape[1]
 
@@ -194,7 +169,7 @@ if use_joint_encoder:
         gat_hidden=256,         # GAT layers
         heads=4,
         dropout=0.4,
-        use_cross_attention=True,   # NOUVEAU: Attention croisée ARN ↔ Protéines
+        use_cross_attention=False,   # NOUVEAU: Attention croisée ARN ↔ Protéines
         use_global_pooling=False    # False: prédiction par nœud (cellule centrale)
     )
 else:
@@ -209,20 +184,20 @@ else:
 
 
 # ## 4. Entraînement du modèle
-
-
 # Créer le trainer
 
-trainer = Trainer(
+trainer = SubgraphTrainer(
         model=model,
         subgraphs_list=subgraphs_list,
         train_indices=train_indices,
         val_indices=val_indices,
         test_indices=test_indices,
-        batch_size=300,
-        lr=0.001,
+        batch_size=400,
+        lr=0.005,
         weight_decay=5e-4,
-        device=device
+        device=device,
+        lambda_smooth=0,# Prior spatial: encourage les cellules voisines à être proches
+
     )
 
 
@@ -230,7 +205,7 @@ trainer = Trainer(
 # Entraîner le modèle
 best_model_state = trainer.train(
     epochs=200,
-    early_stopping_patience=20,
+    early_stopping_patience=10,
     verbose=True
 )
 
@@ -241,8 +216,6 @@ plot_training_history(history, save_path='results/training_history.png')
 
 
 # ## 5. Évaluation sur l'ensemble de test
-
-
 # Prédire sur l'ensemble de test
 
 # Pour les sous-graphes, utiliser la méthode spécifique
@@ -288,7 +261,6 @@ worst_cells, best_cells = analyze_extreme_errors(
 
 # ## 6. Sauvegarder le modèle
 # Créer le dossier results s'il n'existe pas
-import os
 os.makedirs('results', exist_ok=True)
 
 # Sauvegarder le modèle

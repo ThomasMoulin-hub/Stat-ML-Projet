@@ -107,12 +107,13 @@ def build_local_subgraphs(features, spatial_coords, k=29, metric='cosine', seed=
         edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
 
         # Créer l'objet Data
-        # La cible est UNIQUEMENT la position de la cellule centrale (nœud 0)
+        # MODIFICATION: Inclure les positions de TOUTES les cellules pour supervision complète
         data = Data(
             x=torch.tensor(subgraph_features, dtype=torch.float32),
             edge_index=edge_index,
-            y=torch.tensor(subgraph_coords[0:1], dtype=torch.float32),  # Seulement cellule centrale
-            pos_original=torch.tensor(subgraph_coords_original[0:1], dtype=torch.float32),
+            y=torch.tensor(subgraph_coords, dtype=torch.float32),  # TOUTES les cellules (k+1)
+            y_central=torch.tensor(subgraph_coords[0:1], dtype=torch.float32),  # Garde l'ancienne version pour compatibilité
+            pos_original=torch.tensor(subgraph_coords_original, dtype=torch.float32),  # Toutes les positions originales
             central_idx=torch.tensor([i], dtype=torch.long)  # Index global de la cellule centrale
         )
 
@@ -122,7 +123,7 @@ def build_local_subgraphs(features, spatial_coords, k=29, metric='cosine', seed=
     print(f"\n✓ Résumé:")
     print(f"  - {len(subgraphs_list)} sous-graphes créés")
     print(f"  - Chaque sous-graphe: {k+1} nœuds, {edge_index.shape[1]} arêtes")
-    print(f"  - Chaque cible: position de la cellule centrale uniquement")
+    print(f"  - Chaque cible: positions de TOUTES les cellules du sous-graphe (supervision complète)")
 
     return subgraphs_list, coords_scaler
 

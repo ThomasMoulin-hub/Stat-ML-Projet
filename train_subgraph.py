@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.loader import DataLoader
+
 import numpy as np
 import time
 
@@ -16,7 +17,7 @@ class SubgraphTrainer:
     """Classe pour entraîner le modèle sur des sous-graphes locaux."""
     
     def __init__(self, model, subgraphs_list, train_indices, val_indices, test_indices,
-                 batch_size=32, lr=0.001, weight_decay=5e-4, device='cpu'):
+                 batch_size=32, lr=0.001, weight_decay=5e-4, device='cpu', lambda_smooth=0.1):
         """
         Args:
             model: Modèle PyTorch
@@ -26,19 +27,25 @@ class SubgraphTrainer:
             lr: Learning rate
             weight_decay: Régularisation L2
             device: 'cpu' ou 'cuda'
+            lambda_smooth: Coefficient de régularisation spatiale (prior)
         """
-        self.model = model.to(device)
         self.device = device
-        
+        self.model = model.to(device)
+
+
+
+
+        self.lambda_smooth = lambda_smooth  # Prior spatial regularization
+
         # Créer les datasets
         train_subgraphs = [subgraphs_list[i] for i in train_indices]
         val_subgraphs = [subgraphs_list[i] for i in val_indices]
         test_subgraphs = [subgraphs_list[i] for i in test_indices]
         
         # Créer les DataLoaders
-        self.train_loader = DataLoader(train_subgraphs, batch_size=batch_size, persistent_workers=True, num_workers=4, pin_memory=True, shuffle=True, prefetch_factor=10)
-        self.val_loader = DataLoader(val_subgraphs, batch_size=batch_size, persistent_workers=True,num_workers=4, pin_memory=True, shuffle=False, prefetch_factor=10)
-        self.test_loader = DataLoader(test_subgraphs, batch_size=batch_size, num_workers=4, pin_memory=True, shuffle=False, prefetch_factor=10)
+        self.train_loader = DataLoader(train_subgraphs,num_workers=4, persistent_workers=True,prefetch_factor=10,  batch_size=batch_size, pin_memory=True, shuffle=True)
+        self.val_loader = DataLoader(val_subgraphs, batch_size=batch_size, pin_memory=True, shuffle=False,num_workers=4, persistent_workers=True,prefetch_factor=10)
+        self.test_loader = DataLoader(test_subgraphs, batch_size=batch_size, shuffle=False,num_workers=4, persistent_workers=False,prefetch_factor=10)
         
 
         self.optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -49,7 +56,9 @@ class SubgraphTrainer:
             'train_loss': [],
             'val_loss': [],
             'train_mae': [],
-            'val_mae': []
+            'val_mae': [],
+            'train_smooth_loss': [],  # Prior spatial loss
+            'val_smooth_loss': []
         }
         
         print(f"✓ DataLoaders créés:")
@@ -62,87 +71,95 @@ class SubgraphTrainer:
         self.model.train()
         total_loss = 0
         total_mae = 0
+        total_smooth_loss = 0
+        total_main_loss = 0
         n_batches = 0
         
         for batch in self.train_loader:
+            # Transférer le batch vers le GPU
             batch = batch.to(self.device)
+
             self.optimizer.zero_grad()
             
-            # Forward pass - prédire UNIQUEMENT la cellule centrale (nœud 0) de chaque sous-graphe
-            # Passer batch.batch pour le global pooling
-            pred = self.model(batch.x, batch.edge_index, batch.batch)
+            # Forward pass - prédire TOUTES les cellules du sous-graphe
+            pred = self.model(batch)
 
-            # Extraire uniquement les prédictions des cellules centrales
-            # Dans chaque sous-graphe, la cellule centrale est le nœud 0
-            batch_size = batch.num_graphs
-            central_predictions = []
-            
-            # batch.ptr indique où commence chaque graphe dans le batch
-            for i in range(batch_size):
-                start_idx = batch.ptr[i]
-                # Nœud 0 de chaque sous-graphe = cellule centrale
-                central_predictions.append(pred[start_idx])
-            
-            pred_central = torch.stack(central_predictions)
-            
-            # Loss MSE
-            loss = F.mse_loss(pred_central, batch.y)
-            
-            # MAE
-            mae = F.l1_loss(pred_central, batch.y)
-            
+            # MODIFICATION: Superviser TOUTES les prédictions (pas seulement centrales)
+            # batch.y contient maintenant les vraies positions de toutes les cellules
+            main_loss = F.mse_loss(pred, batch.y)
+
+            # Prior spatial: les cellules voisines (connectées par edge_index)
+            # doivent avoir des coordonnées PRÉDITES proches
+            # On utilise TOUTES les prédictions pour le prior
+            pred_source = pred[batch.edge_index[0]]  # Prédictions des nœuds sources des arêtes
+            pred_target = pred[batch.edge_index[1]]  # Prédictions des nœuds cibles des arêtes
+            smooth_loss = torch.mean((pred_source - pred_target) ** 2)
+
+            # Loss totale = Loss principale + Prior spatial pondéré
+            loss = main_loss + self.lambda_smooth * smooth_loss
+
+            # MAE pour toutes les cellules
+            mae = F.l1_loss(pred, batch.y)
+
             loss.backward()
             self.optimizer.step()
             
             total_loss += loss.item()
+            total_main_loss += main_loss.item()
             total_mae += mae.item()
+            total_smooth_loss += smooth_loss.item()
             n_batches += 1
         
-        return total_loss / n_batches, total_mae / n_batches
-    
+        return total_loss / n_batches, total_mae / n_batches, total_smooth_loss / n_batches
+
     @torch.no_grad()
     def evaluate(self, loader):
         """Évalue le modèle sur un DataLoader."""
         self.model.eval()
         total_loss = 0
         total_mae = 0
+        total_smooth_loss = 0
         n_batches = 0
-        all_predictions = []
-        all_targets = []
-        
-        for batch in loader:
-            batch = batch.to(self.device)
-            
-            # Forward pass avec batch pour le global pooling
-            pred = self.model(batch.x, batch.edge_index, batch.batch)
+        all_central_predictions = []  # Pour évaluation finale (seulement centrales)
+        all_central_targets = []
 
-            # Extraire les prédictions des cellules centrales
-            batch_size = batch.num_graphs
-            central_predictions = []
-            
-            for i in range(batch_size):
-                start_idx = batch.ptr[i]
-                central_predictions.append(pred[start_idx])
-            
-            pred_central = torch.stack(central_predictions)
-            
-            # Loss et MAE
-            loss = F.mse_loss(pred_central, batch.y)
-            mae = F.l1_loss(pred_central, batch.y)
-            
+        for batch in loader:
+            # Transférer le batch vers le GPU
+            batch = batch.to(self.device)
+
+            # Forward pass
+            pred = self.model(batch)
+
+            # MODIFICATION: Superviser TOUTES les prédictions
+            main_loss = F.mse_loss(pred, batch.y)
+            mae = F.l1_loss(pred, batch.y)
+
+            # Prior spatial (pour le monitoring)
+            pred_source = pred[batch.edge_index[0]]
+            pred_target = pred[batch.edge_index[1]]
+            smooth_loss = torch.mean((pred_source - pred_target) ** 2)
+
+            # Loss totale
+            loss = main_loss + self.lambda_smooth * smooth_loss
+
             total_loss += loss.item()
             total_mae += mae.item()
+            total_smooth_loss += smooth_loss.item()
             n_batches += 1
             
-            # Sauvegarder pour analyse
-            all_predictions.append(pred_central.cpu())
-            all_targets.append(batch.y.cpu())
-        
-        all_predictions = torch.cat(all_predictions, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
-        
-        return total_loss / n_batches, total_mae / n_batches, all_predictions, all_targets
-    
+            # Extraire les cellules centrales pour métriques finales
+            batch_size = batch.num_graphs
+            for i in range(batch_size):
+                start_idx = batch.ptr[i]
+                all_central_predictions.append(pred[start_idx].cpu())
+                all_central_targets.append(batch.y[start_idx].cpu())
+
+        all_central_predictions = torch.stack(all_central_predictions)
+        all_central_targets = torch.stack(all_central_targets)
+
+        # Retourner les prédictions centrales pour l'évaluation finale
+        return total_loss / n_batches, total_mae / n_batches, all_central_predictions, all_central_targets, total_smooth_loss / n_batches
+
     def train(self, epochs=200, early_stopping_patience=20, verbose=True):
         """
         Boucle d'entraînement complète.
@@ -167,17 +184,19 @@ class SubgraphTrainer:
         
         for epoch in range(1, epochs + 1):
             # Entraînement
-            train_loss, train_mae = self.train_epoch()
-            
+            train_loss, train_mae, train_smooth = self.train_epoch()
+
             # Validation
-            val_loss, val_mae, _, _ = self.evaluate(self.val_loader)
-            
+            val_loss, val_mae, _, _, val_smooth = self.evaluate(self.val_loader)
+
             # Enregistrer l'historique
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             self.history['train_mae'].append(train_mae)
             self.history['val_mae'].append(val_mae)
-            
+            self.history['train_smooth_loss'].append(train_smooth)
+            self.history['val_smooth_loss'].append(val_smooth)
+
             # Scheduler
             self.scheduler.step(val_loss)
             
@@ -190,14 +209,15 @@ class SubgraphTrainer:
                 patience_counter += 1
             
             # Affichage
-            if verbose and (epoch == 1 or epoch % 10 == 0 or patience_counter == 0):
+            if verbose and (epoch == 1 or epoch % 10 == 0 or patience_counter == 0 or epoch == 2):
                 print(f"Epoch {epoch:03d} | "
-                      f"Train Loss: {train_loss:.4f} | Train MAE: {train_mae:.4f} | "
+                      f"Train Loss: {train_loss:.4f} (MSE+λ·Smooth) | Train MAE: {train_mae:.4f} | "
                       f"Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | "
+                      f"Smooth: {train_smooth:.4f}/{val_smooth:.4f} | "
                       f"Best: {best_val_loss:.4f}")
             
             # Arrêt anticipé
-            if patience_counter >= early_stopping_patience:
+            if patience_counter >= early_stopping_patience or epoch >= 50:
                 print(f"\n✓ Early stopping à l'époque {epoch}")
                 break
         
@@ -222,30 +242,37 @@ class SubgraphTrainer:
             coords_scaler: Scaler pour dénormaliser
         
         Returns:
-            predictions, targets: Arrays numpy des prédictions et vraies valeurs
+            predictions, targets: Arrays numpy des prédictions et vraies valeurs (cellules centrales uniquement)
         """
         self.model.eval()
         all_predictions = []
         all_targets = []
         
         for batch in loader:
+            # Transférer le batch vers le GPU
             batch = batch.to(self.device)
-            # Passer batch.batch pour le global pooling
-            pred = self.model(batch.x, batch.edge_index, batch.batch)
 
-            # Extraire cellules centrales
+            # Passer batch.batch pour le global pooling
+            pred = self.model(batch)
+
+            # Extraire cellules centrales (pour prédictions ET targets)
             batch_size = batch.num_graphs
             central_predictions = []
-            
+            central_targets = []
+
             for i in range(batch_size):
                 start_idx = batch.ptr[i]
+                # Prédiction de la cellule centrale
                 central_predictions.append(pred[start_idx])
-            
+                # Vraie position de la cellule centrale (batch.y contient maintenant TOUTES les cellules)
+                central_targets.append(batch.y[start_idx])
+
             pred_central = torch.stack(central_predictions)
-            
+            target_central = torch.stack(central_targets)
+
             all_predictions.append(pred_central.cpu())
-            all_targets.append(batch.y.cpu())
-        
+            all_targets.append(target_central.cpu())
+
         predictions = torch.cat(all_predictions, dim=0).numpy()
         targets = torch.cat(all_targets, dim=0).numpy()
         
@@ -282,7 +309,7 @@ class SubgraphTrainer:
             'history': self.history
         }, path)
         print(f"✓ Modèle sauvegardé: {path}")
-    
+
     def load_model(self, path):
         """Charge un modèle sauvegardé."""
         checkpoint = torch.load(path, map_location=self.device)
@@ -290,4 +317,5 @@ class SubgraphTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.history = checkpoint['history']
         print(f"✓ Modèle chargé: {path}")
+
 
