@@ -12,15 +12,22 @@ from evaluate import (evaluate_predictions, plot_training_history,
                       plot_predictions_vs_true, plot_spatial_predictions,
                       plot_error_distribution, analyze_extreme_errors)
 import os
+import resource
 
-os.system("ulimit -n 65536")
+
+RLIMIT_NOFILE = resource.RLIMIT_NOFILE
+soft_limit_initial, hard_limit_initial = resource.getrlimit(RLIMIT_NOFILE)
+resource.setrlimit(RLIMIT_NOFILE, (hard_limit_initial, hard_limit_initial))
+
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 import pickle
 import json
 
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from train_subgraph import SubgraphTrainer
-from model_joint_encoder import create_joint_encoder_model
+
+
 
 # # Pipeline GNN pour prédiction de coordonnées spatiales
 #
