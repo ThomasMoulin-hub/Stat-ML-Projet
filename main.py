@@ -53,7 +53,7 @@ import torch.distributed as dist
 
 
 
-def run_ddp(rank, world_size, subgraphs_list, train_indices, val_indices, test_indices, coords_scaler):
+def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_indices, scaler_path, n_genes, n_proteins, in_channels, use_joint_encoder):
     # Init process group
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '12355'
@@ -61,6 +61,11 @@ def run_ddp(rank, world_size, subgraphs_list, train_indices, val_indices, test_i
 
     device = f'cuda:{rank}'
     torch.cuda.set_device(rank)
+
+    # Charger les données localement dans chaque process
+    subgraphs_list = torch.load(subgraphs_path, weights_only=False)
+    with open(scaler_path, 'rb') as f:
+        coords_scaler = pickle.load(f)
 
     # Créer le modèle (chaque process crée sa propre instance)
     if use_joint_encoder:
@@ -81,7 +86,7 @@ def run_ddp(rank, world_size, subgraphs_list, train_indices, val_indices, test_i
         train_indices=train_indices,
         val_indices=val_indices,
         test_indices=test_indices,
-        batch_size=400,
+        batch_size=800,
         lr=0.001,
         weight_decay=5e-4,
         device=device,
@@ -97,10 +102,58 @@ def run_ddp(rank, world_size, subgraphs_list, train_indices, val_indices, test_i
     if rank == 0:
         os.makedirs('results', exist_ok=True)
         trainer.save_model('results/spatial_gat_model.pt')
+        # Visualiser l'historique d'entraînement
+        history = trainer.get_history()
+        plot_training_history(history, save_path='results/training_history.png')
+
+        # ## 5. Évaluation sur l'ensemble de test
+        # Prédire sur l'ensemble de test
+
+        # Pour les sous-graphes, utiliser la méthode spécifique
+        y_pred_test, y_true_test = trainer.predict_all(
+            trainer.test_loader,
+            denormalize=True,
+            coords_scaler=coords_scaler
+        )
+
+        # Calculer les métriques
+        metrics, euclidean_distances = evaluate_predictions(
+            y_true_test,
+            y_pred_test,
+            set_name='Test'
+        )
+
+        # Visualiser prédictions vs réalité
+        plot_predictions_vs_true(y_true_test, y_pred_test,
+                                 save_path='results/predictions_vs_true.png')
+
+        # Visualiser les positions spatiales
+        plot_spatial_predictions(y_true_test, y_pred_test, euclidean_distances,
+                                 save_path='results/spatial_predictions.png')
+
+        # Distribution des erreurs
+        plot_error_distribution(euclidean_distances,
+                                save_path='results/error_distribution.png')
+
+        # Analyser les erreurs extrêmes
+        worst_cells, best_cells = analyze_extreme_errors(
+            y_true_test,
+            y_pred_test,
+            euclidean_distances,
+            top_n=10
+        )
+        # Sauvegarder les métriques dans un fichier CSV
+        import pandas as pd
+
+        metrics_df = pd.DataFrame([metrics])
+        metrics_df.to_csv('results/test_metrics.csv', index=False)
+        print("✓ Métriques sauvegardées dans results/test_metrics.csv")
 
     # synchronise puis détruit
     dist.barrier()
     dist.destroy_process_group()
+
+
 
 if __name__ == '__main__':
     print(f"{'=' * 60}")
@@ -218,103 +271,14 @@ if __name__ == '__main__':
     print(f"  • Protéines: {n_proteins}")
     print(f"  • Total features: {in_channels}")
 
+    del subgraphs_list
     # Choisir l'architecture: 'joint_encoder' ou 'standard'
     use_joint_encoder = True  # Mettre False pour utiliser l'ancien modèle
+    world_size = 4
 
-    if use_joint_encoder:
-        print(f"\n🧬 Utilisation du Joint Encoder (ARN et Protéines séparés)")
-        model = create_joint_encoder_model(
-            n_genes=n_genes,
-            n_proteins=n_proteins,
-            model_type='large',  # 'base' ou 'large'
-            rna_hidden=256,  # Encodeur ARN
-            protein_hidden=128,  # Encodeur protéines
-            joint_hidden=256,  # Représentation fusionnée
-            gat_hidden=256,  # GAT layers
-            heads=4,
-            dropout=0.4,
-            use_cross_attention=False,  # NOUVEAU: Attention croisée ARN ↔ Protéines
-            use_global_pooling=False  # False: prédiction par nœud (cellule centrale)
-        )
-    else:
-        print(f"\n📊 Utilisation du modèle standard (toutes features concaténées)")
-        model = create_model(
-            in_channels=in_channels,
-            model_type='large',
-            hidden_channels=256,
-            heads=4,
-            dropout=0.4
-        )
-
-
-    world_size = torch.cuda.device_count()
-    if world_size <= 1:
-        # fallback single-GPU / CPU
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        trainer = SubgraphTrainer(
-            model=model,
-            subgraphs_list=subgraphs_list,
-            train_indices=train_indices,
-            val_indices=val_indices,
-            test_indices=test_indices,
-            batch_size=400,
-            lr=0.001,
-            weight_decay=5e-4,
-            device=device,
-            lambda_smooth=0,
-            distributed=False,
-            rank=0,
-            world_size=1
-        )
-        trainer.train(epochs=200, early_stopping_patience=10, verbose=True)
-        trainer.save_model('results/spatial_gat_model.pt')
-    else:
-        mp.spawn(run_ddp, args=(world_size, subgraphs_list, train_indices, val_indices, test_indices, coords_scaler),
-                 nprocs=world_size, join=True)
-
-    # Visualiser l'historique d'entraînement
-    history = trainer.get_history()
-    plot_training_history(history, save_path='results/training_history.png')
-
-    # ## 5. Évaluation sur l'ensemble de test
-    # Prédire sur l'ensemble de test
-
-    # Pour les sous-graphes, utiliser la méthode spécifique
-    y_pred_test, y_true_test = trainer.predict_all(
-        trainer.test_loader,
-        denormalize=True,
-        coords_scaler=coords_scaler
-    )
-
-    # Calculer les métriques
-    metrics, euclidean_distances = evaluate_predictions(
-        y_true_test,
-        y_pred_test,
-        set_name='Test'
-    )
-
-    # Visualiser prédictions vs réalité
-    plot_predictions_vs_true(y_true_test, y_pred_test,
-                             save_path='results/predictions_vs_true.png')
-
-    # Visualiser les positions spatiales
-    plot_spatial_predictions(y_true_test, y_pred_test, euclidean_distances,
-                             save_path='results/spatial_predictions.png')
-
-    # Distribution des erreurs
-    plot_error_distribution(euclidean_distances,
-                            save_path='results/error_distribution.png')
-
-    # Analyser les erreurs extrêmes
-    worst_cells, best_cells = analyze_extreme_errors(
-        y_true_test,
-        y_pred_test,
-        euclidean_distances,
-        top_n=10
-    )
-    # Sauvegarder les métriques dans un fichier CSV
-    import pandas as pd
-
-    metrics_df = pd.DataFrame([metrics])
-    metrics_df.to_csv('results/test_metrics.csv', index=False)
-    print("✓ Métriques sauvegardées dans results/test_metrics.csv")
+    mp.spawn(
+        run_ddp,
+        args=(world_size, subgraphs_path, train_indices, val_indices, test_indices,
+              scaler_path, n_genes, n_proteins, in_channels, use_joint_encoder),
+        nprocs=world_size,
+        join=True)

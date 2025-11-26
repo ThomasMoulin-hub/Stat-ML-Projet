@@ -165,4 +165,3 @@ def create_train_val_test_masks(n_nodes, train_ratio=0.7, val_ratio=0.15, test_r
     print(f"\n✓ Split: Train={train_mask.sum()}, Val={val_mask.sum()}, Test={test_mask.sum()}")
 
     return train_mask, val_mask, test_mask
-

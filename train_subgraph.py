@@ -66,12 +66,12 @@ class SubgraphTrainer:
                                                shuffle=True)
             val_sampler = DistributedSampler(val_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False)
             test_sampler = DistributedSampler(test_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False)
-            self.train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler,
-                                           num_workers=2, pin_memory=True)
-            self.val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler,
-                                         num_workers=2, pin_memory=True)
+            self.train_loader = DataLoader(train_dataset, batch_size=batch_size,persistent_workers=False, sampler=train_sampler,
+                                           num_workers=0, pin_memory=False)
+            self.val_loader = DataLoader(val_dataset, batch_size=batch_size,persistent_workers=False, sampler=val_sampler,
+                                         num_workers=0, pin_memory=False)
             self.test_loader = DataLoader(test_dataset, batch_size=batch_size, sampler=test_sampler,
-                                          num_workers=2, pin_memory=True)
+                                          num_workers=0, pin_memory=False)
             self.train_sampler = train_sampler
         else:
             self.train_loader = DataLoader(train_subgraphs, batch_size=batch_size, shuffle=True,
@@ -200,7 +200,7 @@ class SubgraphTrainer:
             if self.distributed and self.world_size > 1:
                 torch.distributed.barrier()
 
-            if self.rank == 0 and patience_counter >= early_stopping_patience:
+            if self.rank == 0 and patience_counter >= early_stopping_patience and epoch == 50:
                 print(f"\n✓ Early stopping à l'époque {epoch}")
                 break
 
