@@ -193,8 +193,11 @@ class SubgraphTrainer:
                     patience_counter += 1
 
                 if verbose and (epoch == 1 or epoch % 10 == 0 or patience_counter == 0 or epoch == 2):
-                    print(
-                        f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f}")
+                    print(f"Epoch {epoch:03d} | "
+                          f"Train Loss: {train_loss:.4f} (MSE+λ·Smooth) | Train MAE: {train_mae:.4f} | "
+                          f"Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | "
+                          f"Smooth: {train_smooth:.4f}/{val_smooth:.4f} | "
+                          f"Best: {best_val_loss:.4f}")
 
             # Synchroniser tous les processes pour être sûrs que le rank 0 ait fini d'écrire/lecture
             if self.distributed and self.world_size > 1:

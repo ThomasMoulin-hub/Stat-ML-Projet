@@ -72,8 +72,8 @@ def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_i
         model = create_joint_encoder_model(n_genes=n_genes, n_proteins=n_proteins,
                                           model_type='large',
                                           rna_hidden=256, protein_hidden=128,
-                                          joint_hidden=256, gat_hidden=256,
-                                          heads=4, dropout=0.4,
+                                          joint_hidden=400, gat_hidden=400,
+                                          heads=4, dropout=0.3,
                                           use_cross_attention=False,
                                           use_global_pooling=False)
     else:
@@ -122,7 +122,7 @@ def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_i
             y_pred_test,
             set_name='Test'
         )
-
+ 
         # Visualiser prédictions vs réalité
         plot_predictions_vs_true(y_true_test, y_pred_test,
                                  save_path='results/predictions_vs_true.png')
