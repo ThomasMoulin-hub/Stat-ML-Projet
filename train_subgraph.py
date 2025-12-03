@@ -36,11 +36,42 @@ class SubgraphTrainer:
 
     def __init__(self, model, subgraphs_list, train_indices, val_indices, test_indices,
                  batch_size=32, lr=0.001, weight_decay=5e-4, device='cpu',
-                 lambda_smooth=0.1, distributed=False, rank=0, world_size=1):
+                 lambda_smooth=0.1, distributed=False, rank=0, world_size=1, coords_scaler=None,
+                 loss_type='rmse_normalized', max_grad_norm=1.0):
+        """
+        Args:
+            loss_type: Type de loss à utiliser
+                - 'mse': MSE en pixels² (très grande magnitude)
+                - 'rmse': RMSE en pixels (racine de MSE)
+                - 'rmse_normalized': RMSE / plage_spatiale (recommandé, échelle [0,1])
+                - 'huber': Huber loss en pixels avec delta=100
+            max_grad_norm: Clipping des gradients (None = pas de clipping)
+        """
         self.device = device
         self.rank = rank
         self.world_size = world_size
         self.distributed = distributed
+        self.coords_scaler = coords_scaler  # Stocker le scaler pour dénormalisation
+        self.loss_type = loss_type
+        self.max_grad_norm = max_grad_norm
+
+        # Calculer la plage spatiale pour normalisation si scaler disponible
+        if self.coords_scaler is not None and hasattr(self.coords_scaler, 'data_range_'):
+            # MinMaxScaler stocke la plage dans data_range_
+            self.spatial_range = float(torch.tensor(self.coords_scaler.data_range_).mean())
+        elif self.coords_scaler is not None and hasattr(self.coords_scaler, 'data_max_'):
+            # Calcul manuel pour MinMaxScaler
+            self.spatial_range = float(torch.tensor(self.coords_scaler.data_max_ - self.coords_scaler.data_min_).mean())
+        else:
+            self.spatial_range = 1.0  # Fallback
+
+        if self.rank == 0:
+            print(f"  📊 Loss type: {loss_type}")
+            if loss_type == 'rmse_normalized':
+                print(f"  📏 Plage spatiale moyenne: {self.spatial_range:.1f} pixels")
+                print(f"  📐 Loss sera normalisée par cette plage → échelle ~[0, 1]")
+            if max_grad_norm is not None:
+                print(f"  ✂️  Gradient clipping: max_norm={max_grad_norm}")
 
         # Gérer le model -> déplacer sur device + DDP wrap si demandé
         model = model.to(device)
@@ -86,6 +117,7 @@ class SubgraphTrainer:
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=10)
 
         self.history = {'train_loss': [], 'val_loss': [], 'train_mae': [], 'val_mae': [],
+                        'train_mae_real': [], 'val_mae_real': [],  # MAE en pixels réels
                         'train_smooth_loss': [], 'val_smooth_loss': []}
 
         if self.rank == 0:
@@ -93,10 +125,63 @@ class SubgraphTrainer:
             print(f"  Train: {len(train_dataset)} sous-graphes, {len(self.train_loader)} batches")
             print(f"  Val: {len(val_dataset)} sous-graphes, {len(self.val_loader)} batches")
             print(f"  Test: {len(test_dataset)} sous-graphes, {len(self.test_loader)} batches")
+            if self.coords_scaler is not None:
+                print(f"  ⚠ Loss calculée dans l'espace réel (pixels) pour éviter l'amplification des erreurs")
+
+    def denormalize_coords(self, coords_normalized):
+        """Dénormalise les coordonnées (tensor GPU -> numpy CPU -> dénorm -> tensor GPU)"""
+        if self.coords_scaler is None:
+            return coords_normalized
+        coords_np = coords_normalized.detach().cpu().numpy()
+        coords_real = self.coords_scaler.inverse_transform(coords_np)
+        return torch.tensor(coords_real, dtype=torch.float32, device=coords_normalized.device)
+
+    def compute_main_loss(self, pred, target, pred_real, target_real):
+        """
+        Calcule la loss principale selon le type choisi.
+
+        Args:
+            pred: Prédictions en espace normalisé
+            target: Targets en espace normalisé
+            pred_real: Prédictions en pixels réels
+            target_real: Targets en pixels réels
+
+        Returns:
+            loss: Loss principale
+            mae_real: MAE en pixels réels (pour affichage)
+        """
+        if self.loss_type == 'mse':
+            # MSE en pixels² (magnitude très élevée)
+            loss = F.mse_loss(pred_real, target_real)
+            mae_real = F.l1_loss(pred_real, target_real)
+
+        elif self.loss_type == 'rmse':
+            # RMSE en pixels (racine de MSE)
+            mse = F.mse_loss(pred_real, target_real)
+            loss = torch.sqrt(mse + 1e-8)  # epsilon pour stabilité
+            mae_real = F.l1_loss(pred_real, target_real)
+
+        elif self.loss_type == 'rmse_normalized':
+            # RMSE normalisé par la plage spatiale → échelle ~[0, 1]
+            mse = F.mse_loss(pred_real, target_real)
+            rmse = torch.sqrt(mse + 1e-8)
+            loss = rmse / self.spatial_range  # Normalisation
+            mae_real = F.l1_loss(pred_real, target_real)
+
+        elif self.loss_type == 'huber':
+            # Huber loss en pixels avec delta=100px
+            loss = F.huber_loss(pred_real, target_real, delta=100.0)
+            mae_real = F.l1_loss(pred_real, target_real)
+
+        else:
+            raise ValueError(f"loss_type '{self.loss_type}' non reconnu")
+
+        return loss, mae_real
 
     def train_epoch(self, epoch=None):
         self.model.train()
         total_loss = total_mae = total_smooth_loss = total_main_loss = 0.0
+        total_mae_real = 0.0  # MAE en espace réel (pixels)
         n_batches = 0
 
         if self.train_sampler is not None and epoch is not None:
@@ -106,29 +191,55 @@ class SubgraphTrainer:
             batch = batch.to(self.device)
             self.optimizer.zero_grad()
             pred = self.model(batch)
-            main_loss = F.mse_loss(pred, batch.y)
+
+            # Calculer la loss principale dans l'espace réel (pixels) si scaler disponible
+            if self.coords_scaler is not None:
+                # Dénormaliser prédictions et targets pour calculer loss en pixels
+                pred_real = self.denormalize_coords(pred)
+                target_real = self.denormalize_coords(batch.y)
+                main_loss, mae_real = self.compute_main_loss(pred, batch.y, pred_real, target_real)
+                # Loss normalisée pour comparaison
+                mae = F.l1_loss(pred, batch.y)
+            else:
+                # Fallback: loss en espace normalisé
+                main_loss = F.mse_loss(pred, batch.y)
+                mae = F.l1_loss(pred, batch.y)
+                mae_real = mae
+
+            # Smooth loss reste en espace normalisé (cohérence topologique)
             pred_source = pred[batch.edge_index[0]]
             pred_target = pred[batch.edge_index[1]]
             smooth_loss = torch.mean((pred_source - pred_target) ** 2)
-            loss = main_loss + self.lambda_smooth * smooth_loss
-            mae = F.l1_loss(pred, batch.y)
+
+            loss = mae + self.lambda_smooth * smooth_loss
 
             loss.backward()
+
+            # Gradient clipping si activé
+            if self.max_grad_norm is not None:
+                if hasattr(self.model, 'module'):
+                    torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), self.max_grad_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
             self.optimizer.step()
 
             total_loss += loss.item()
             total_main_loss += main_loss.item()
             total_mae += mae.item()
+            total_mae_real += mae_real.item()
             total_smooth_loss += smooth_loss.item()
             n_batches += 1
 
-        return total_loss / n_batches, total_mae / n_batches, total_smooth_loss / n_batches
+        return (total_loss / n_batches, total_mae / n_batches, total_smooth_loss / n_batches,
+                total_mae_real / n_batches)
 
     @torch.no_grad()
     def evaluate(self, loader):
         # identique à ta version, renvoie métriques et centrales
         self.model.eval()
         total_loss = total_mae = total_smooth_loss = 0.0
+        total_mae_real = 0.0
         n_batches = 0
         all_central_predictions = []
         all_central_targets = []
@@ -136,8 +247,18 @@ class SubgraphTrainer:
         for batch in loader:
             batch = batch.to(self.device)
             pred = self.model(batch)
-            main_loss = F.mse_loss(pred, batch.y)
-            mae = F.l1_loss(pred, batch.y)
+
+            # Calculer métriques en espace réel si scaler disponible
+            if self.coords_scaler is not None:
+                pred_real = self.denormalize_coords(pred)
+                target_real = self.denormalize_coords(batch.y)
+                main_loss, mae_real = self.compute_main_loss(pred, batch.y, pred_real, target_real)
+                mae = F.l1_loss(pred, batch.y)
+            else:
+                main_loss = F.mse_loss(pred, batch.y)
+                mae = F.l1_loss(pred, batch.y)
+                mae_real = mae
+
             pred_source = pred[batch.edge_index[0]]
             pred_target = pred[batch.edge_index[1]]
             smooth_loss = torch.mean((pred_source - pred_target) ** 2)
@@ -145,6 +266,7 @@ class SubgraphTrainer:
 
             total_loss += loss.item()
             total_mae += mae.item()
+            total_mae_real += mae_real.item()
             total_smooth_loss += smooth_loss.item()
             n_batches += 1
 
@@ -157,7 +279,8 @@ class SubgraphTrainer:
         all_central_predictions = torch.stack(all_central_predictions)
         all_central_targets = torch.stack(all_central_targets)
 
-        return total_loss / n_batches, total_mae / n_batches, all_central_predictions, all_central_targets, total_smooth_loss / n_batches
+        return (total_loss / n_batches, total_mae / n_batches, all_central_predictions,
+                all_central_targets, total_smooth_loss / n_batches, total_mae_real / n_batches)
 
     def train(self, epochs=200, early_stopping_patience=20, verbose=True):
         best_val_loss = float('inf')
@@ -166,10 +289,10 @@ class SubgraphTrainer:
 
         start_time = time.time()
         for epoch in range(1, epochs + 1):
-            train_loss, train_mae, train_smooth = self.train_epoch(epoch)
+            train_loss, train_mae, train_smooth, train_mae_real = self.train_epoch(epoch)
             # Validation (si distributed : on évalue sur la partition du rank ;
             # simplification : on évalue localement et on laisse rank 0 afficher)
-            val_loss, val_mae, _, _, val_smooth = self.evaluate(self.val_loader)
+            val_loss, val_mae, _, _, val_smooth, val_mae_real = self.evaluate(self.val_loader)
 
             # Ne pas agrèger les métriques sur tous les ranks pour garder l'exemple simple.
             # On sauvegarde le modèle si rank==0
@@ -178,6 +301,8 @@ class SubgraphTrainer:
                 self.history['val_loss'].append(val_loss)
                 self.history['train_mae'].append(train_mae)
                 self.history['val_mae'].append(val_mae)
+                self.history['train_mae_real'].append(train_mae_real)
+                self.history['val_mae_real'].append(val_mae_real)
                 self.history['train_smooth_loss'].append(train_smooth)
                 self.history['val_smooth_loss'].append(val_smooth)
 
@@ -193,17 +318,34 @@ class SubgraphTrainer:
                     patience_counter += 1
 
                 if verbose and (epoch == 1 or epoch % 10 == 0 or patience_counter == 0 or epoch == 2):
-                    print(f"Epoch {epoch:03d} | "
-                          f"Train Loss: {train_loss:.4f} (MSE+λ·Smooth) | Train MAE: {train_mae:.4f} | "
-                          f"Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | "
-                          f"Smooth: {train_smooth:.4f}/{val_smooth:.4f} | "
-                          f"Best: {best_val_loss:.4f}")
+                    if self.coords_scaler is not None:
+                        loss_unit = ""
+                        if self.loss_type == 'mse':
+                            loss_unit = " (px²)"
+                        elif self.loss_type == 'rmse':
+                            loss_unit = " (px)"
+                        elif self.loss_type == 'rmse_normalized':
+                            loss_unit = " (norm)"
+                        elif self.loss_type == 'huber':
+                            loss_unit = " (huber)"
+
+                        print(f"Epoch {epoch:03d} | "
+                              f"Loss{loss_unit}: {train_loss:.4f}/{val_loss:.4f} | "
+                              f"MAE(px): {train_mae_real:.1f}/{val_mae_real:.1f} | "
+                              f"Smooth: {train_smooth:.4f}/{val_smooth:.4f} | "
+                              f"Best: {best_val_loss:.4f}")
+                    else:
+                        print(f"Epoch {epoch:03d} | "
+                              f"Train Loss: {train_loss:.4f} (MSE+λ·Smooth) | Train MAE: {train_mae:.4f} | "
+                              f"Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | "
+                              f"Smooth: {train_smooth:.4f}/{val_smooth:.4f} | "
+                              f"Best: {best_val_loss:.4f}")
 
             # Synchroniser tous les processes pour être sûrs que le rank 0 ait fini d'écrire/lecture
             if self.distributed and self.world_size > 1:
                 torch.distributed.barrier()
 
-            if self.rank == 0 and patience_counter >= early_stopping_patience and epoch == 50:
+            if self.rank == 0 and patience_counter >= early_stopping_patience:
                 print(f"\n✓ Early stopping à l'époque {epoch}")
                 break
 

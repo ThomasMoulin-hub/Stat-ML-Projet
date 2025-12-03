@@ -12,63 +12,65 @@ from torch_geometric.data import Data
 from scipy.sparse import issparse
 
 
-def preprocess_adata(adata, normalize_genes=True, normalize_proteins=True):
+def preprocess_adata(adata, normalize_genes=True,
+                     min_genes_per_cell=200, min_cells_per_gene=3):
     """
     Filtre et normalise les données d'expression.
 
     Args:
         adata: AnnData object contenant les données Xenium
         normalize_genes: Si True, applique normalize_total + log1p aux gènes
-        normalize_proteins: Si True, applique z-score aux protéines
+        normalize_proteins: Ignoré (pour compatibilité)
+        min_genes_per_cell: Nombre minimum de gènes détectés par cellule
+        min_cells_per_gene: Nombre minimum de cellules exprimant un gène
 
     Returns:
-        adata_processed: AnnData avec seulement Gene Expression et Protein Expression
+        adata_processed: AnnData avec seulement Gene Expression (RNA)
     """
-    # Créer les masques
-    gene_mask = adata.var["feature_types"] == "Gene Expression"
-    prot_mask = adata.var["feature_types"] == "Protein Expression"
+    print(f"📊 Données initiales: {adata.n_obs} cellules, {adata.n_vars} features")
 
-    # Filtrer pour ne garder que gènes et protéines
-    keep_mask = gene_mask | prot_mask
-    adata_filtered = adata[:, keep_mask].copy()
+    # Créer le masque pour ne garder que les gènes
+    gene_mask = adata.var["feature_types"] == "Gene Expression"
+
+    # Filtrer pour ne garder QUE les gènes (pas de protéines)
+    adata_filtered = adata[:, gene_mask].copy()
+
+    print(f"Après filtrage des protéines: {adata_filtered.n_obs} cellules, {adata_filtered.n_vars} gènes")
 
     # Convertir en dense dès le début pour simplifier
     if issparse(adata_filtered.X):
         adata_filtered.X = adata_filtered.X.toarray()
 
-    print(f"Nombre de cellules: {adata_filtered.n_obs}")
-    print(f"Nombre de gènes: {gene_mask.sum()}")
-    print(f"Nombre de protéines: {prot_mask.sum()}")
-    print(f"Total features: {adata_filtered.n_vars}")
+    # 🔍 FILTRAGE DE QUALITÉ
+    print(f"\n🔍 Filtrage de qualité...")
+    print(f"   • Seuil cellules: min {min_genes_per_cell} gènes détectés")
+    print(f"   • Seuil gènes: min {min_cells_per_gene} cellules")
+
+    # Filtrer les cellules avec peu de gènes détectés
+    n_genes_per_cell = (adata_filtered.X > 0).sum(axis=1)
+    cell_mask = n_genes_per_cell >= min_genes_per_cell
+    adata_filtered = adata_filtered[cell_mask, :].copy()
+    print(f"   ✓ Cellules après filtrage: {adata_filtered.n_obs} ({cell_mask.sum()}/{len(cell_mask)})")
+
+    # Filtrer les gènes exprimés dans peu de cellules
+    n_cells_per_gene = (adata_filtered.X > 0).sum(axis=0)
+    gene_filter_mask = n_cells_per_gene >= min_cells_per_gene
+    adata_filtered = adata_filtered[:, gene_filter_mask].copy()
+    print(f"   ✓ Gènes après filtrage: {adata_filtered.n_vars} ({gene_filter_mask.sum()}/{len(gene_filter_mask)})")
+
+    print(f"\n📊 Données après filtrage de qualité:")
+    print(f"   • Cellules: {adata_filtered.n_obs}")
+    print(f"   • Gènes (RNA): {adata_filtered.n_vars}")
+    print(f"   • Total features: {adata_filtered.n_vars}")
 
     # Normalisation des gènes
     if normalize_genes:
-        # Créer une copie pour les gènes
-        gene_mask_filtered = (adata_filtered.var["feature_types"] == "Gene Expression").values
-        adata_genes = adata_filtered[:, gene_mask_filtered].copy()
-
         # Normalisation scanpy (total counts + log1p)
-        sc.pp.normalize_total(adata_genes, target_sum=1e4)
-        sc.pp.log1p(adata_genes)
-
-        # Remplacer les valeurs dans adata_filtered
-        adata_filtered.X[:, gene_mask_filtered] = adata_genes.X
+        sc.pp.normalize_total(adata_filtered, target_sum=1e4)
+        sc.pp.log1p(adata_filtered)
         print("✓ Gènes normalisés (normalize_total + log1p)")
 
-    # Normalisation des protéines (z-score)
-    if normalize_proteins:
-        prot_mask_filtered = (adata_filtered.var["feature_types"] == "Protein Expression").values
-
-        # Extraire les protéines
-        prot_data = adata_filtered.X[:, prot_mask_filtered]
-
-        # Standardisation z-score
-        scaler = StandardScaler()
-        prot_normalized = scaler.fit_transform(prot_data)
-
-        # Remplacer les valeurs
-        adata_filtered.X[:, prot_mask_filtered] = prot_normalized
-        print("✓ Protéines normalisées (z-score)")
+    # Pas de normalisation de protéines puisqu'elles sont exclues
 
     return adata_filtered
 

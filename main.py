@@ -32,7 +32,7 @@ import torch.distributed as dist
 # # Pipeline GNN pour prédiction de coordonnées spatiales
 #
 # Ce notebook implémente un Graph Neural Network (GAT) qui prédit les coordonnées
-# spatiales des cellules basé uniquement sur leurs profils d'expression d'ARN et de protéines.
+# spatiales des cellules basé uniquement sur leurs profils d'expression d'ARN.
 # Le graphe K-NN est construit sur la similarité d'expression (pas les coordonnées).
 #
 # ## ⚙️ Deux approches disponibles :
@@ -53,14 +53,28 @@ import torch.distributed as dist
 
 
 
-def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_indices, scaler_path, n_genes, n_proteins, in_channels, use_joint_encoder):
+def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_indices, scaler_path, n_genes, in_channels, use_joint_encoder):
     # Init process group
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+
+    # Vérifier que CUDA est disponible
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA non disponible sur le rank {rank}. DDP nécessite des GPUs.")
+
+    if rank >= torch.cuda.device_count():
+        raise RuntimeError(f"Rank {rank} demandé mais seulement {torch.cuda.device_count()} GPU(s) disponible(s).")
 
     device = f'cuda:{rank}'
     torch.cuda.set_device(rank)
+
+    # Initialiser le process group avec device_id explicite pour éviter le warning
+    # (Disponible sur PyTorch récents)
+    try:
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size, device_id=rank)
+    except TypeError:
+        # Fallback pour versions qui n’acceptent pas device_id
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
 
     # Charger les données localement dans chaque process
     subgraphs_list = torch.load(subgraphs_path, weights_only=False)
@@ -69,13 +83,11 @@ def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_i
 
     # Créer le modèle (chaque process crée sa propre instance)
     if use_joint_encoder:
-        model = create_joint_encoder_model(n_genes=n_genes, n_proteins=n_proteins,
-                                          model_type='large',
-                                          rna_hidden=256, protein_hidden=128,
-                                          joint_hidden=400, gat_hidden=400,
-                                          heads=4, dropout=0.3,
-                                          use_cross_attention=False,
-                                          use_global_pooling=False)
+        model = create_joint_encoder_model(n_genes=n_genes,
+                                          model_type='base',
+                                          rna_hidden=400, gat_hidden=400,
+                                          heads=6, dropout=0.3,
+                                          )
     else:
         model = create_model(in_channels=in_channels, model_type='large', hidden_channels=256,
                              heads=4, dropout=0.4)
@@ -86,25 +98,28 @@ def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_i
         train_indices=train_indices,
         val_indices=val_indices,
         test_indices=test_indices,
-        batch_size=800,
-        lr=0.001,
+        batch_size=500,
+        lr=0.001,  # Augmenté pour compenser la nouvelle échelle de loss
         weight_decay=5e-4,
         device=device,
         lambda_smooth=0,
         distributed=True,
         rank=rank,
-        world_size=world_size
+        world_size=world_size,
+        #coords_scaler=coords_scaler,  # Ajouter le scaler pour calcul en espace réel
+        loss_type='rmse_normalized',  # RMSE normalisé par la plage spatiale → échelle ~[0,1]
+        max_grad_norm=1.0  # Gradient clipping pour stabilité
     )
 
-    best_state = trainer.train(epochs=200, early_stopping_patience=10, verbose=True)
+    best_state = trainer.train(epochs=200, early_stopping_patience=20, verbose=True)
 
     # Sauvegarder le modèle uniquement sur rank 0
     if rank == 0:
-        os.makedirs('results', exist_ok=True)
+        os.makedirs('results_rna_proteine_100knn', exist_ok=True)
         trainer.save_model('results/spatial_gat_model.pt')
         # Visualiser l'historique d'entraînement
         history = trainer.get_history()
-        plot_training_history(history, save_path='results/training_history.png')
+        plot_training_history(history, save_path='results_rna_proteine_100knn/training_history.png')
 
         # ## 5. Évaluation sur l'ensemble de test
         # Prédire sur l'ensemble de test
@@ -125,15 +140,15 @@ def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_i
  
         # Visualiser prédictions vs réalité
         plot_predictions_vs_true(y_true_test, y_pred_test,
-                                 save_path='results/predictions_vs_true.png')
+                                 save_path='results_rna_proteine_100knn/predictions_vs_true.png')
 
         # Visualiser les positions spatiales
         plot_spatial_predictions(y_true_test, y_pred_test, euclidean_distances,
-                                 save_path='results/spatial_predictions.png')
+                                 save_path='results_rna_proteine_100knn/spatial_predictions.png')
 
         # Distribution des erreurs
         plot_error_distribution(euclidean_distances,
-                                save_path='results/error_distribution.png')
+                                save_path='results_rna_proteine_100knn/error_distribution.png')
 
         # Analyser les erreurs extrêmes
         worst_cells, best_cells = analyze_extreme_errors(
@@ -150,7 +165,12 @@ def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_i
         print("✓ Métriques sauvegardées dans results/test_metrics.csv")
 
     # synchronise puis détruit
-    dist.barrier()
+    try:
+        # Spécifier device_ids pour barrier afin de supprimer le warning
+        dist.barrier(device_ids=[rank])
+    except TypeError:
+        # Fallback si la signature ne supporte pas device_ids
+        dist.barrier()
     dist.destroy_process_group()
 
 
@@ -162,7 +182,7 @@ if __name__ == '__main__':
 
     print(f"Device utilisé: {device}")
     print("🎯 Approche: SOUS-GRAPHES LOCAUX")
-    print("   • Chaque point = 1 cellule centrale + 49 voisins")
+    print("   • Chaque point = 1 cellule centrale + 99 voisins")
     print("   • Entraînement: supervision de TOUTES les cellules")
     print("   • Évaluation: prédiction des cellules centrales uniquement")
     print("   • Traitement par batches")
@@ -179,12 +199,22 @@ if __name__ == '__main__':
                        nucleus_boundaries=False, cells_labels=False, nucleus_labels=False, cells_as_circles=True)
     # Récupère l'AnnData
     adata = sdata.tables["table"]
-    adata_processed = preprocess_adata(adata, normalize_genes=True, normalize_proteins=True)
+
+    # Paramètres de filtrage de qualité
+    MIN_GENES_PER_CELL = 0  # Cellules avec au moins 200 gènes détectés
+    MIN_CELLS_PER_GENE = 0    # Gènes exprimés dans au moins 3 cellules
+
+    adata_processed = preprocess_adata(
+        adata,
+        normalize_genes=True,
+        min_genes_per_cell=MIN_GENES_PER_CELL,
+        min_cells_per_gene=MIN_CELLS_PER_GENE
+    )
 
     # Approche sous-graphes locaux
     print("Construction des sous-graphes locaux...")
     # Paramètres de construction
-    k_value = 49
+    k_value = 99
     metric_value = 'euclidean'
     cache_dir = 'cache_' + dataset_name
     os.makedirs(cache_dir, exist_ok=True)
@@ -262,13 +292,12 @@ if __name__ == '__main__':
     # Créer le modèle avec Joint Encoder
     in_channels = subgraphs_list[0].x.shape[1]
 
-    # Récupérer le nombre de gènes et protéines
+    # Récupérer le nombre de gènes uniquement (pas de protéines)
     n_genes = (adata_processed.var["feature_types"] == "Gene Expression").sum()
-    n_proteins = (adata_processed.var["feature_types"] == "Protein Expression").sum()
 
     print(f"\n📊 Modalités biologiques:")
-    print(f"  • Gènes: {n_genes}")
-    print(f"  • Protéines: {n_proteins}")
+    print(f"  • Gènes (RNA): {n_genes}")
+    print(f"  • Protéines: 0 (désactivées)")
     print(f"  • Total features: {in_channels}")
 
     del subgraphs_list
@@ -279,6 +308,6 @@ if __name__ == '__main__':
     mp.spawn(
         run_ddp,
         args=(world_size, subgraphs_path, train_indices, val_indices, test_indices,
-              scaler_path, n_genes, n_proteins, in_channels, use_joint_encoder),
+              scaler_path, n_genes, in_channels, use_joint_encoder),
         nprocs=world_size,
         join=True)
