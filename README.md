@@ -1,131 +1,113 @@
-# Spatial Transcriptomics Prediction with Graph Neural Networks
+# Spatial GNN for Xenium data — Local Subgraph Training with Joint Encoder
 
-A Graph Attention Network (GAT) that predicts spatial cell coordinates from gene and protein expression profiles, using Xenium spatial transcriptomics data.
+This repository implements a spatial Graph Neural Network (GAT) to predict cell spatial coordinates using only molecular profiles (RNA + protein) from 10x Xenium outputs. The graph is constructed from expression similarity (K-NN) rather than physical proximity.
 
-## Overview
+- Local subgraphs: one subgraph per cell (central + k neighbors). The model predicts the central cell’s coordinates while learning over its local neighborhood. Batching across many subgraphs enables scalable training and DDP.
 
-This project implements a GNN-based approach to predict cell locations based on their molecular profiles (RNA + proteins), demonstrating that spatial organization correlates with gene expression patterns. The model uses **local subgraph architecture**: each training point is a subgraph of 30 cells (1 target + 29 neighbors).
 
-## Key Features
+## Key features
+- Xenium data ingestion via `spatialdata_io` and AnnData processing.
+- Modality-aware Joint Encoder that splits RNA and protein features, then fuses representations before GAT.
+- GAT stack with residual connections, dropout, to produce 2D spatial coordinates.
+- Local subgraph construction per cell: k neighbors by expression similarity, bidirectional star edges to the central node.
+- Distributed Data Parallel (DDP) training using PyTorch with `torch.multiprocessing.spawn` and NCCL backend.
+- Comprehensive evaluation: MSE/MAE, R² per axis, Euclidean error distribution, prediction vs truth plots, and spatial error heatmaps.
+- Caching of preprocessed subgraphs, scalers, and splits to accelerate reproducible runs.
 
-- **Joint Encoder Architecture**: Separate encoders for RNA and protein data with optional cross-modal attention
-- **Local Subgraph Approach**: Each cell is predicted using only its k-nearest neighbors (based on expression similarity)
-- **K-NN Graph Construction**: Graph edges based on gene expression similarity (cosine distance), not spatial proximity
-- **Efficient Caching**: Pre-computed subgraphs and data splits for faster training iterations
 
-## Architecture
+## Repository structure
+- `main.py`: Entry point for local subgraph pipeline with DDP training and evaluation.
+- `data_preprocessing.py`: AnnData filtering and normalization; optional global K-NN graph creation.
+- `data_preprocessing_subgraph.py`: Local subgraph builder per cell and train/val/test split creation.
+- `model_joint_encoder.py`: Joint Encoder architectures (base/large) with optional cross-modal attention; GAT stacks with residuals and pooling.
+- `model.py`: Simpler GAT baselines (base/large) without joint modality separation.
+- `train_subgraph.py`: Trainer for batched local subgraphs; supports single-GPU and DDP; smoothing regularizer.
+- `evaluate.py`: Metrics and plotting utilities for training curves, prediction scatter, spatial visualization, and error analysis.
+- `requirements.txt`: Python dependencies.
+- `data/`: Datasets (Xenium and other sources as laid out below).
+- `cache_*`: Cached subgraphs, scalers, splits, metadata.
+- `results_*` and `results/`: Saved checkpoints, metrics, and plots.
 
-```
-Input: RNA (genes) + Protein features per cell
-   ↓
-[RNA Encoder] + [Protein Encoder]
-   ↓
-[Cross-Modal Attention] (optional)
-   ↓
-[Joint Representation]
-   ↓
-[GAT Layers] - Graph convolution over k-NN graph
-   ↓
-Output: Predicted (x, y) spatial coordinates
-```
 
-## Installation
+## Data requirements and layout
+The default dataset in `main.py` expects Xenium outputs:
+- `data/Xenium_V1_Human_Kidney_FFPE_Protein_updated_outs/`
 
-```bash
-pip install -r requirements.txt
-```
+Other folders present (not required for the default run):
+- `data/Xenium_Prime_Human_Ovary_FF_outs/`
+- `data/LiverDataReleaseTileDB/` (TileDB layout)
+- `data/breast.zarr/` (Zarr layout)
+- `data/GSE158013_RAW/` (scATAC-related inputs)
 
-**Requirements**: PyTorch, PyTorch Geometric, SpatialData, scikit-learn, pandas, matplotlib
+The pipeline uses `spatialdata_io.xenium(...)` with options to include gene and protein modalities and to represent cells as circles. The main AnnData table is available at `sdata.tables["table"]`. Features are filtered to keep only `var["feature_types"] in {"Gene Expression", "Protein Expression"}`.
 
-## Usage
 
-```bash
-python main.py
-```
+## Preprocessing details
+Implemented in `data_preprocessing.py::preprocess_adata`:
+- Gene features: Scanpy `normalize_total(target_sum=1e4)` followed by `log1p`.
+- Protein features: StandardScaler z-score per feature.
+- Sparse matrices: converted to dense up front for simplicity.
 
-The pipeline automatically:
-1. Loads Xenium kidney data from `./data/Xenium_V1_Human_Kidney_FFPE_Protein_updated_outs/`
-2. Preprocesses and normalizes gene/protein expression
-3. Builds local subgraphs (k=49 neighbors, cosine similarity)
-4. Trains the GAT model with early stopping
-5. Evaluates on test set and saves results to `./results/`
+Local subgraph construction in `data_preprocessing_subgraph.py::build_local_subgraphs`:
+- Similarity: scikit-learn `NearestNeighbors(n_neighbors=k+1, metric=cosine|euclidean, n_jobs=-1)` fits on normalized features.
+- For each cell i, build nodes: [central=i, neighbors=indices[i, 1:k+1]].
+- Edges: bidirectional star from central (0) to each neighbor (1..k).
+- Targets: normalized spatial coordinates for all nodes in the subgraph (supervision over all nodes), with `y_central` kept for compatibility.
+- Normalization: StandardScaler fit on global spatial coordinates; inverse transform used at evaluation if requested.
+- Returns: `List[torch_geometric.data.Data]`, each with `x`, `edge_index`, `y`, `y_central`, `pos_original`, and `central_idx`.
 
-## Project Structure
+Train/val/test split creation in `create_subgraph_splits`: random permutation with ratios (default 70/15/15) and fixed seed.
 
-- **`main.py`**: Main training pipeline
-- **`model_joint_encoder.py`**: Joint encoder architecture with cross-modal attention
-- **`model.py`**: Standard GAT model (all features concatenated)
-- **`data_preprocessing.py`**: Data filtering and normalization
-- **`data_preprocessing_subgraph.py`**: Local subgraph construction
-- **`train_subgraph.py`**: Training loop for subgraph-based models
-- **`evaluate.py`**: Evaluation metrics and visualization
 
-## Model Variants
+## Model architectures
+Joint Encoder models (`model_joint_encoder.py`):
+- Split input features into RNA (n_genes) and protein (n_proteins).
+- Independent encoders with LayerNorm, ReLU, Dropout; configurable dimensions.
+- Fusion MLP to produce a joint representation fed to GAT layers.
+- GAT stack with residual projections to stabilize deep attention layers.
 
-### 1. Joint Encoder (Recommended)
-```python
-use_joint_encoder = True  # Separate RNA/protein encoders
-```
-- Better captures modality-specific patterns
-- Prevents proteins (fewer features) from being dominated by genes
-- Optional cross-modal attention mechanism
 
-### 2. Standard Model
-```python
-use_joint_encoder = False  # Concatenated features
-```
-- Simpler baseline approach
-- All features processed together
+Baseline GAT models (`model.py`): simpler two- or three-layer GAT with a final MLP; no modality separation.
 
-## Hyperparameters
+Losses and regularizers (`train_subgraph.py`):
+- Main loss: MSE on predicted vs normalized coordinates for all nodes in the batch.
+- MAE tracked for reporting; ReduceLROnPlateau scheduler on validation loss.
 
-```python
-k_value = 49              # Number of neighbors per subgraph
-metric_value = 'cosine'   # Distance metric for K-NN
-batch_size = 300          # Subgraphs per batch
-epochs = 200              # Maximum training epochs
-early_stopping = 20       # Patience for early stopping
-lr = 0.001                # Learning rate
-dropout = 0.4             # Dropout rate
-```
 
-## Output
+## Training pipeline (DDP local subgraphs)
+The main entry `main.py` orchestrates:
+1. Resource setup: increase file descriptor limits and set PyTorch’s sharing strategy to `file_system`.
+2. Load Xenium dataset via `spatialdata_io.xenium(...)`; get AnnData table.
+3. Preprocess features with gene/protein normalization.
+4. Cache handling: if cached `subgraphs.pt`, `scaler.pkl`, and `metadata.json` exist, reuse them; else build and cache.
+5. Derive `n_genes` and `n_proteins` from `adata.var["feature_types"]` counts.
+6. Create or load train/val/test splits; save to JSON for reproducibility.
+7. Determine `in_channels` and select architecture; default uses Joint Encoder with parameters in `create_joint_encoder_model(...)`.
+8. Spawn DDP processes via `torch.multiprocessing.spawn` with `world_size=4`.
+9. In each rank:
+   - Initialize `torch.distributed` with NCCL backend and bind rank to `cuda:rank`.
+   - Load cached subgraphs and scaler locally.
+   - Build `SubgraphTrainer` with `DistributedSampler`s and DDP-wrapped model.
+   - Train with early stopping and scheduler.
+10. On rank 0 only:
+    - Save checkpoint to `results/spatial_gat_model.pt`.
+    - Plot training history.
+    - Predict on test set, denormalize if requested.
+    - Compute metrics; save `results/test_metrics.csv`.
+    - Save plots: predictions vs truth, spatial predictions, error distribution; print extreme errors summary.
 
-Results saved to `./results/`:
-- `training_history.png`: Loss curves
-- `predictions_vs_true.png`: Scatter plots of predicted vs true coordinates
-- `spatial_predictions.png`: Spatial visualization with error magnitude
-- `error_distribution.png`: Euclidean distance distribution
-- `test_metrics.csv`: MAE, RMSE, R² scores
-- `spatial_gat_model.pt`: Trained model weights
 
-## Performance Metrics
 
-The model is evaluated using:
-- **MAE** (Mean Absolute Error): Average coordinate error
-- **RMSE** (Root Mean Squared Error): Penalizes large errors
-- **R²**: Goodness of fit (per dimension)
-- **Euclidean Distance**: Physical distance between predicted and true positions
+## Outputs
+On successful training (rank 0):
+- `results/spatial_gat_model.pt`: checkpoint with model state, optimizer state, and training history.
+- `results/training_history.png`: loss and MAE curves for train/val.
+- `results/predictions_vs_true.png`: scatter plots for X and Y predictions.
+- `results/spatial_predictions.png`: spatial scatter of true vs predicted and error heatmap.
+- `results/error_distribution.png`: histogram and boxplot of Euclidean errors.
+- `results/test_metrics.csv`: MSE, MAE, R² per axis, and Euclidean distance statistics.
 
-## Data
 
-Expected data structure:
-```
-data/
-  Xenium_V1_Human_Kidney_FFPE_Protein_updated_outs/
-    (Xenium output files)
-```
-
-The code uses Xenium spatial transcriptomics data with:
-- Gene expression matrix
-- Protein expression matrix
-- Spatial coordinates (ground truth)
-
-## Caching
-
-Subgraph construction is cached in `cache_Xenium_V1_Human_Kidney_FFPE_Protein_updated_outs/`:
-- `subgraphs_k{k}_metric_{metric}.pt`: Pre-computed subgraphs
-- `subgraphs_k{k}_metric_{metric}_scaler.pkl`: Coordinate scaler
-- `subgraphs_k{k}_metric_{metric}_splits.json`: Train/val/test splits
-
-Delete cache folder to rebuild from scratch.
+## Practical notes
+- Normalization: coordinate scaler is fit globally; predictions are trained in normalized space and denormalized for reporting.
+- Reproducibility: splits and metadata are persisted to cache; seeds applied in split creation.

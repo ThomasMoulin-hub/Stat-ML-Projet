@@ -304,7 +304,7 @@ class SpatialGATWithJointEncoder(nn.Module):
             nn.Linear(32, out_channels)
         )
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, data):
         """
         Forward pass avec encodage séparé des modalités.
 
@@ -316,6 +316,8 @@ class SpatialGATWithJointEncoder(nn.Module):
         Returns:
             out: Coordonnées prédites (n_nodes ou batch_size, 2)
         """
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
         # 1. Encoder séparément ARN et protéines puis fusionner
         x = self.joint_encoder(x)
 

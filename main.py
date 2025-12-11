@@ -70,10 +70,10 @@ def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_i
     # Créer le modèle (chaque process crée sa propre instance)
     if use_joint_encoder:
         model = create_joint_encoder_model(n_genes=n_genes, n_proteins=n_proteins,
-                                          model_type='large',
+                                          model_type='base',
                                           rna_hidden=256, protein_hidden=128,
                                           joint_hidden=400, gat_hidden=400,
-                                          heads=4, dropout=0.3,
+                                          heads=6, dropout=0.3,
                                           use_cross_attention=False,
                                           use_global_pooling=False)
     else:
@@ -86,7 +86,7 @@ def run_ddp(rank, world_size, subgraphs_path, train_indices, val_indices, test_i
         train_indices=train_indices,
         val_indices=val_indices,
         test_indices=test_indices,
-        batch_size=800,
+        batch_size=600,
         lr=0.001,
         weight_decay=5e-4,
         device=device,
@@ -184,7 +184,7 @@ if __name__ == '__main__':
     # Approche sous-graphes locaux
     print("Construction des sous-graphes locaux...")
     # Paramètres de construction
-    k_value = 49
+    k_value = 99
     metric_value = 'euclidean'
     cache_dir = 'cache_' + dataset_name
     os.makedirs(cache_dir, exist_ok=True)
@@ -192,13 +192,18 @@ if __name__ == '__main__':
     subgraphs_path = os.path.join(cache_dir, cache_key + '.pt')
     scaler_path = os.path.join(cache_dir, cache_key + '_scaler.pkl')
     splits_path = os.path.join(cache_dir, cache_key + '_splits.json')
+    metadata_path = os.path.join(cache_dir, cache_key + '_metadata.json')
 
-    use_cache = os.path.exists(subgraphs_path) and os.path.exists(scaler_path)
+    use_cache = os.path.exists(subgraphs_path) and os.path.exists(scaler_path) and os.path.exists(metadata_path)
     if use_cache:
         print(f"🔁 Cache détecté: chargement depuis {cache_dir}/")
         subgraphs_list = torch.load(subgraphs_path, weights_only=False)
         with open(scaler_path, 'rb') as f:
             coords_scaler = pickle.load(f)
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+            n_genes = metadata['n_genes']
+            n_proteins = metadata['n_proteins']
     else:
         # Extraire les features et coordonnées spatiales
         if issparse(adata_processed.X):
@@ -211,6 +216,10 @@ if __name__ == '__main__':
         print(f"Shape des features: {features.shape}")
         print(f"Shape des coordonnées: {spatial_coords.shape}")
 
+        # Calculer n_genes et n_proteins
+        n_genes = int((adata_processed.var["feature_types"] == "Gene Expression").sum())
+        n_proteins = int((adata_processed.var["feature_types"] == "Protein Expression").sum())
+
         print("🚀 Pas de cache ou incomplet: construction des sous-graphes")
         subgraphs_list, coords_scaler = build_local_subgraphs(
             features=features,
@@ -222,7 +231,13 @@ if __name__ == '__main__':
         torch.save(subgraphs_list, subgraphs_path)
         with open(scaler_path, 'wb') as f:
             pickle.dump(coords_scaler, f)
-        print(f"💾 Sous-graphes et scaler sauvegardés dans {cache_dir}/")
+        # Sauvegarder les métadonnées
+        with open(metadata_path, 'w') as f:
+            json.dump({
+                'n_genes': n_genes,
+                'n_proteins': n_proteins
+            }, f)
+        print(f"💾 Sous-graphes, scaler et métadonnées sauvegardés dans {cache_dir}/")
 
     # Créer / charger les splits d'indices
     if os.path.exists(splits_path):
@@ -262,9 +277,6 @@ if __name__ == '__main__':
     # Créer le modèle avec Joint Encoder
     in_channels = subgraphs_list[0].x.shape[1]
 
-    # Récupérer le nombre de gènes et protéines
-    n_genes = (adata_processed.var["feature_types"] == "Gene Expression").sum()
-    n_proteins = (adata_processed.var["feature_types"] == "Protein Expression").sum()
 
     print(f"\n📊 Modalités biologiques:")
     print(f"  • Gènes: {n_genes}")

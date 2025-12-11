@@ -110,8 +110,9 @@ class SubgraphTrainer:
             pred_source = pred[batch.edge_index[0]]
             pred_target = pred[batch.edge_index[1]]
             smooth_loss = torch.mean((pred_source - pred_target) ** 2)
-            loss = main_loss + self.lambda_smooth * smooth_loss
             mae = F.l1_loss(pred, batch.y)
+            loss = mae
+
 
             loss.backward()
             self.optimizer.step()
@@ -203,7 +204,7 @@ class SubgraphTrainer:
             if self.distributed and self.world_size > 1:
                 torch.distributed.barrier()
 
-            if self.rank == 0 and patience_counter >= early_stopping_patience and epoch == 50:
+            if self.rank == 0 and patience_counter >= early_stopping_patience:
                 print(f"\n✓ Early stopping à l'époque {epoch}")
                 break
 
