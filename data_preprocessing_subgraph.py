@@ -150,7 +150,54 @@ def create_subgraph_splits(n_subgraphs, train_ratio=0.7, val_ratio=0.15, test_ra
     val_indices = indices[train_size:train_size + val_size].tolist()
     test_indices = indices[train_size + val_size:].tolist()
 
-    print(f"\n✓ Split: Train={len(train_indices)}, Val={len(val_indices)}, Test={len(test_indices)}")
+
+def create_spatial_splits(spatial_coords, train_val_ratio=0.85, seed=42):
+    """
+    Crée des splits basés sur la position spatiale (axe X).
+    Train/Val: moitié gauche (X < médiane)
+    Test: moitié droite (X >= médiane)
+
+    Args:
+        spatial_coords: Coordonnées spatiales (n_cells, 2)
+        train_val_ratio: Ratio train/(train+val) pour la moitié gauche
+        seed: Pour reproductibilité
+
+    Returns:
+        train_indices, val_indices, test_indices: Listes d'indices
+    """
+    np.random.seed(seed)
+
+    # Extraire les coordonnées X
+    x_coords = spatial_coords[:, 0]
+
+    # Calculer la médiane sur l'axe X
+    x_median = np.median(x_coords)
+
+    print(f"\n📍 Split spatial sur l'axe X:")
+    print(f"  - Médiane X: {x_median:.2f}")
+    print(f"  - Range X: [{x_coords.min():.2f}, {x_coords.max():.2f}]")
+
+    # Cellules de gauche (X < médiane) -> Train/Val
+    left_indices = np.where(x_coords < x_median)[0]
+    # Cellules de droite (X >= médiane) -> Test
+    right_indices = np.where(x_coords >= x_median)[0]
+
+    print(f"  - Cellules gauche (train/val): {len(left_indices)} ({100*len(left_indices)/len(x_coords):.1f}%)")
+    print(f"  - Cellules droite (test): {len(right_indices)} ({100*len(right_indices)/len(x_coords):.1f}%)")
+
+    # Shuffle les indices de la moitié gauche
+    np.random.shuffle(left_indices)
+
+    # Split train/val dans la moitié gauche
+    train_size = int(train_val_ratio * len(left_indices))
+
+    train_indices = left_indices[:train_size].tolist()
+    val_indices = left_indices[train_size:].tolist()
+    test_indices = right_indices.tolist()
+
+    print(f"  ✓ Train: {len(train_indices)} cellules (gauche)")
+    print(f"  ✓ Val: {len(val_indices)} cellules (gauche)")
+    print(f"  ✓ Test: {len(test_indices)} cellules (droite)")
 
     return train_indices, val_indices, test_indices
 

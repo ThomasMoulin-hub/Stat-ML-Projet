@@ -5,7 +5,7 @@ import torch
 from scipy.sparse import issparse
 from model_joint_encoder import create_joint_encoder_model
 from data_preprocessing import preprocess_adata
-from data_preprocessing_subgraph import build_local_subgraphs, create_subgraph_splits
+from data_preprocessing_subgraph import build_local_subgraphs, create_subgraph_splits, create_spatial_splits
 from train_subgraph import SubgraphTrainer
 from model import create_model
 from evaluate import (evaluate_predictions, plot_training_history,
@@ -239,24 +239,30 @@ if __name__ == '__main__':
             }, f)
         print(f"💾 Sous-graphes, scaler et métadonnées sauvegardés dans {cache_dir}/")
 
-    # Créer / charger les splits d'indices
-    if os.path.exists(splits_path):
-        print("🔁 Chargement des splits depuis le cache")
-        with open(splits_path, 'r') as f:
+    # Récupérer les coordonnées spatiales (nécessaires pour les splits spatiaux)
+    if issparse(adata_processed.X):
+        features = adata_processed.X.toarray()
+    else:
+        features = adata_processed.X
+    spatial_coords = adata_processed.obsm["spatial"]
+
+    # Créer / charger les splits d'indices (SPATIAL SPLITS)
+    spatial_splits_path = os.path.join(cache_dir, cache_key + '_spatial_splits.json')
+    if os.path.exists(spatial_splits_path):
+        print("🔁 Chargement des splits spatiaux depuis le cache")
+        with open(spatial_splits_path, 'r') as f:
             splits_data = json.load(f)
         train_indices = splits_data['train_indices']
         val_indices = splits_data['val_indices']
         test_indices = splits_data['test_indices']
     else:
-        print("⚙️ Création des splits d'entraînement/validation/test")
-        train_indices, val_indices, test_indices = create_subgraph_splits(
-            n_subgraphs=len(subgraphs_list),
-            train_ratio=0.7,
-            val_ratio=0.15,
-            test_ratio=0.15,
+        print("⚙️ Création des splits spatiaux (gauche: train/val, droite: test)")
+        train_indices, val_indices, test_indices = create_spatial_splits(
+            spatial_coords=spatial_coords,
+            train_val_ratio=0.7,
             seed=42
         )
-        with open(splits_path, 'w') as f:
+        with open(spatial_splits_path, 'w') as f:
             json.dump({
                 'train_indices': train_indices,
                 'val_indices': val_indices,
